@@ -1,6 +1,6 @@
 """
 Single-shot stock check for the Norge Hjemmedrakt — runs once, then exits.
-Fetches via api.allorigins.win to avoid CDN bot detection on Unisport.
+Tries multiple proxies to bypass CDN bot detection on Unisport.
 """
 
 import json
@@ -18,7 +18,13 @@ TARGET_SIZE = "3XL"
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 NTFY_URL   = f"https://ntfy.sh/{NTFY_TOPIC}" if NTFY_TOPIC else None
 
-PROXY_BASE = "https://api.allorigins.win/raw?url="
+# Tried in order — first one that returns a real-looking page wins.
+PROXIES = [
+    "https://corsproxy.io/?url=",
+    "https://api.codetabs.com/v1/proxy?quest=",
+    "https://api.allorigins.win/raw?url=",
+    "https://cors.lol/?url=",
+]
 
 HEADERS = {
     "User-Agent": (
@@ -34,12 +40,23 @@ def log(msg: str) -> None:
     print(f"[{datetime.utcnow().isoformat(timespec='seconds')}Z] {msg}", flush=True)
 
 
-def fetch_html() -> str:
-    """Route through allorigins so Unisport's CDN sees the proxy, not GitHub."""
-    proxied = PROXY_BASE + quote(PRODUCT_URL, safe="")
-    r = requests.get(proxied, headers=HEADERS, timeout=30)
-    r.raise_for_status()
-    return r.text
+def fetch_html() -> str | None:
+    """Try each proxy until one returns HTML that contains __NEXT_DATA__."""
+    encoded = quote(PRODUCT_URL, safe="")
+    for proxy in PROXIES:
+        url = proxy + encoded
+        proxy_name = proxy.split("//")[1].split("/")[0]
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=30)
+            r.raise_for_status()
+            html = r.text
+            if "__NEXT_DATA__" in html:
+                log(f"Got {len(html)} bytes via {proxy_name} ✓")
+                return html
+            log(f"{proxy_name}: returned {len(html)} bytes but no __NEXT_DATA__ — trying next")
+        except Exception as e:
+            log(f"{proxy_name}: {e} — trying next")
+    return None
 
 
 def extract_next_data(html: str):
@@ -77,7 +94,14 @@ def find_variants(obj):
 
 
 def normalize(s: str) -> str:
-    return re.sub(r"[\s\-_]", "", str(s)).upper()
+    """Normalize size labels: '3XL', 'XXXL', '3X-LARGE' all become 'XXX'."""
+    s = re.sub(r"[\s\-_]", "", str(s)).upper()
+    s = s.replace("LARGE", "L").replace("MEDIUM", "M").replace("SMALL", "S")
+    # Expand 3XL / 4XL etc. to XXXL / XXXXL
+    m = re.match(r"^(\d+)X+L?$", s)
+    if m:
+        s = "X" * int(m.group(1)) + "L"
+    return s
 
 
 def variant_size_label(v: dict) -> str:
@@ -109,13 +133,14 @@ def check_size_available(html: str, target: str):
     target_norm = normalize(target)
     if data:
         variants = find_variants(data)
-        matches  = [v for v in variants if normalize(variant_size_label(v)) == target_norm]
+        all_labels = sorted({variant_size_label(v) for v in variants if variant_size_label(v)})
+        matches = [v for v in variants if normalize(variant_size_label(v)) == target_norm]
         if matches:
             for v in matches:
                 if variant_in_stock(v) is True:
                     return True, f"JSON variant in stock: {variant_size_label(v)}"
-            return False, f"JSON found {len(matches)} variant(s) for {target} but none in stock"
-        debug = f"JSON parsed, no variant for {target} ({len(variants)} variants total)"
+            return False, f"{len(matches)} variant(s) for {target} but none in stock"
+        debug = f"No variant for {target}. All size labels found: {all_labels[:20]}"
     else:
         debug = "No __NEXT_DATA__ block found"
 
@@ -152,13 +177,11 @@ def send_ntfy(title: str, message: str) -> None:
 
 
 def main() -> int:
-    log(f"Checking {TARGET_SIZE} on Unisport (via proxy)…")
-    try:
-        html = fetch_html()
-        log(f"Fetched {len(html)} bytes.")
-    except Exception as e:
-        log(f"Fetch failed: {e}")
-        return 0  # don't fail the workflow on transient errors
+    log(f"Checking {TARGET_SIZE} on Unisport…")
+    html = fetch_html()
+    if html is None:
+        log("All proxies failed.")
+        return 0
 
     available, info = check_size_available(html, TARGET_SIZE)
     if available:
