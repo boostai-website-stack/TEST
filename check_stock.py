@@ -13,7 +13,7 @@ from urllib.parse import quote
 import requests
 
 PRODUCT_URL = "https://www.unisportstore.no/fotballdrakter/norge-hjemmedrakt-world-cup-2026/461740/"
-TARGET_SIZE = "3XL"
+TARGET_SIZE = "XL"
 PRODUCT_ID  = "461740"
 
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
