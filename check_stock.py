@@ -1,10 +1,9 @@
 """
-Single-shot stock check for the Norge Hjemmedrakt.
-Diagnostic version — prints HTML context around the target size to help us
-figure out exactly how Unisport encodes stock data.
+Stock check for the Norge Hjemmedrakt — single run, exits when done.
+Parses Unisport's Next.js App Router payload for the target size's
+'availability' field. Sends ntfy push when 'in stock'.
 """
 
-import json
 import os
 import re
 import sys
@@ -14,13 +13,12 @@ from urllib.parse import quote
 import requests
 
 PRODUCT_URL = "https://www.unisportstore.no/fotballdrakter/norge-hjemmedrakt-world-cup-2026/461740/"
-TARGET_SIZE = "3XL"
+TARGET_SIZE = "XL"
 PRODUCT_ID  = "461740"
 
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 NTFY_URL   = f"https://ntfy.sh/{NTFY_TOPIC}" if NTFY_TOPIC else None
 
-# codetabs first — it's the one that actually returns real HTML for us.
 PROXIES = [
     "https://api.codetabs.com/v1/proxy?quest=",
     "https://api.allorigins.win/raw?url=",
@@ -35,65 +33,54 @@ HEADERS = {
     "Accept-Language": "nb-NO,nb;q=0.9,en;q=0.8",
 }
 
+IN_STOCK_VALUES = {"in stock", "instock", "in_stock", "available", "yes"}
+
 
 def log(msg: str) -> None:
     print(f"[{datetime.utcnow().isoformat(timespec='seconds')}Z] {msg}", flush=True)
 
 
 def fetch_html() -> str | None:
-    """Try proxies; validate by presence of the product ID in the response."""
     encoded = quote(PRODUCT_URL, safe="")
     for proxy in PROXIES:
-        url = proxy + encoded
         name = proxy.split("//")[1].split("/")[0]
         try:
-            r = requests.get(url, headers=HEADERS, timeout=30)
+            r = requests.get(proxy + encoded, headers=HEADERS, timeout=30)
             r.raise_for_status()
             html = r.text
             if PRODUCT_ID in html:
-                log(f"{name}: {len(html)} bytes, product ID found ✓")
+                log(f"{name}: {len(html)} bytes ✓")
                 return html
-            log(f"{name}: {len(html)} bytes but product ID missing — trying next")
+            log(f"{name}: {len(html)} bytes, product ID missing — trying next")
         except Exception as e:
             log(f"{name}: {e} — trying next")
     return None
 
 
-def dump_size_context(html: str, target: str) -> None:
-    """Print all snippets of HTML around occurrences of the target size."""
-    log(f"--- Searching for '{target}' in HTML ---")
-    count = 0
-    for m in re.finditer(re.escape(target), html):
-        count += 1
-        if count > 6:
-            log(f"  (… {len([1 for _ in re.finditer(re.escape(target), html)]) - 6} more occurrences omitted)")
-            break
-        start = max(0, m.start() - 120)
-        end = min(len(html), m.end() + 250)
-        snippet = html[start:end].replace("\n", " ").replace("  ", " ")
-        log(f"  [match {count}] …{snippet}…")
-    if count == 0:
-        log(f"  '{target}' not found in HTML at all.")
-    log(f"--- End search ({count} matches found) ---")
+def check_size_available(html: str, target: str) -> tuple[bool, str]:
+    """
+    Variants live as escaped JSON inside __next_f.push chunks:
+        \"name\":\"3XL\", ... ,\"availability\":\"in stock\"
+    We look for the size's name followed (within ~1000 chars) by an
+    availability value, then judge whether that value means 'in stock'.
+    """
+    target_esc = re.escape(target)
+    pattern = (
+        r'\\"name\\":\\"' + target_esc + r'\\"'
+        r'.{0,1000}?'
+        r'\\"availability\\":\\"([^"\\]+)\\"'
+    )
+    m = re.search(pattern, html, re.DOTALL)
+    if m:
+        availability = m.group(1).strip().lower()
+        if availability in IN_STOCK_VALUES:
+            return True, f"availability = '{m.group(1)}'"
+        return False, f"availability = '{m.group(1)}'"
 
-
-def look_for_data_patterns(html: str) -> None:
-    """Scan for likely places that contain size/stock data."""
-    log("--- Scanning for data containers ---")
-    patterns = [
-        (r'<script id="__NEXT_DATA__"', "__NEXT_DATA__ script tag"),
-        (r'self\.__next_f\.push', "Next.js App Router payload (__next_f)"),
-        (r'window\.__INITIAL_STATE__', "Generic window.__INITIAL_STATE__"),
-        (r'"variants"\s*:', "JSON 'variants' key"),
-        (r'"sizes"\s*:', "JSON 'sizes' key"),
-        (r'"inStock"', "JSON 'inStock' key"),
-        (r'"available"', "JSON 'available' key"),
-        (r'data-size=', "HTML data-size attribute"),
-    ]
-    for pat, label in patterns:
-        hits = len(re.findall(pat, html))
-        log(f"  {label}: {hits} occurrences")
-    log("--- End scan ---")
+    # Size didn't match alongside an availability field — see if it exists at all
+    if re.search(r'\\"name\\":\\"' + target_esc + r'\\"', html):
+        return False, f"variant '{target}' present but no availability field nearby"
+    return False, f"variant '{target}' not found in page data"
 
 
 def send_ntfy(title: str, message: str) -> None:
@@ -120,25 +107,18 @@ def main() -> int:
     log(f"Checking {TARGET_SIZE} on Unisport…")
     html = fetch_html()
     if html is None:
-        log("All proxies failed.")
+        log("All proxies failed — will try again next run.")
         return 0
 
-    look_for_data_patterns(html)
-    dump_size_context(html, TARGET_SIZE)
-
-    # Also try common quick stock checks for now — we'll refine after seeing context.
-    quick_in_stock = re.search(
-        rf'"3XL"[^{{}}]{{0,200}}("inStock"\s*:\s*true|"available"\s*:\s*true|"stock"\s*:\s*[1-9])',
-        html, re.IGNORECASE,
-    )
-    if quick_in_stock:
-        log(f"✅ Quick check says {TARGET_SIZE} is available")
+    available, info = check_size_available(html, TARGET_SIZE)
+    if available:
+        log(f"✅ {TARGET_SIZE} IS AVAILABLE — {info}")
         send_ntfy(
             f"Norge jersey: {TARGET_SIZE} in stock!",
             f"Tap to buy now.\n{PRODUCT_URL}",
         )
     else:
-        log(f"❌ Quick check: {TARGET_SIZE} not detected as available")
+        log(f"❌ {TARGET_SIZE} not available — {info}")
     return 0
 
 
