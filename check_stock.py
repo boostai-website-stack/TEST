@@ -1,6 +1,6 @@
 """
 Single-shot stock check for the Norge Hjemmedrakt — runs once, then exits.
-GitHub Actions handles the scheduling. Notifies via ntfy.sh on a hit.
+Fetches via api.allorigins.win to avoid CDN bot detection on Unisport.
 """
 
 import json
@@ -8,26 +8,38 @@ import os
 import re
 import sys
 from datetime import datetime
+from urllib.parse import quote
 
 import requests
 
 PRODUCT_URL = "https://www.unisportstore.no/fotballdrakter/norge-hjemmedrakt-world-cup-2026/461740/"
-TARGET_SIZE = "3XL"
+TARGET_SIZE = "XL"
 
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 NTFY_URL   = f"https://ntfy.sh/{NTFY_TOPIC}" if NTFY_TOPIC else None
 
+PROXY_BASE = "https://api.allorigins.win/raw?url="
+
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
     ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "nb-NO,nb;q=0.9,en;q=0.8",
 }
 
 
 def log(msg: str) -> None:
     print(f"[{datetime.utcnow().isoformat(timespec='seconds')}Z] {msg}", flush=True)
+
+
+def fetch_html() -> str:
+    """Route through allorigins so Unisport's CDN sees the proxy, not GitHub."""
+    proxied = PROXY_BASE + quote(PRODUCT_URL, safe="")
+    r = requests.get(proxied, headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    return r.text
 
 
 def extract_next_data(html: str):
@@ -140,15 +152,15 @@ def send_ntfy(title: str, message: str) -> None:
 
 
 def main() -> int:
-    log(f"Checking {TARGET_SIZE} on Unisport…")
+    log(f"Checking {TARGET_SIZE} on Unisport (via proxy)…")
     try:
-        r = requests.get(PRODUCT_URL, headers=HEADERS, timeout=20)
-        r.raise_for_status()
+        html = fetch_html()
+        log(f"Fetched {len(html)} bytes.")
     except Exception as e:
         log(f"Fetch failed: {e}")
         return 0  # don't fail the workflow on transient errors
 
-    available, info = check_size_available(r.text, TARGET_SIZE)
+    available, info = check_size_available(html, TARGET_SIZE)
     if available:
         log(f"✅ {TARGET_SIZE} IS AVAILABLE — {info}")
         send_ntfy(
