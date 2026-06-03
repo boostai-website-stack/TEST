@@ -1,6 +1,7 @@
 """
-Single-shot stock check for the Norge Hjemmedrakt — runs once, then exits.
-Tries multiple proxies to bypass CDN bot detection on Unisport.
+Single-shot stock check for the Norge Hjemmedrakt.
+Diagnostic version — prints HTML context around the target size to help us
+figure out exactly how Unisport encodes stock data.
 """
 
 import json
@@ -14,16 +15,15 @@ import requests
 
 PRODUCT_URL = "https://www.unisportstore.no/fotballdrakter/norge-hjemmedrakt-world-cup-2026/461740/"
 TARGET_SIZE = "3XL"
+PRODUCT_ID  = "461740"
 
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 NTFY_URL   = f"https://ntfy.sh/{NTFY_TOPIC}" if NTFY_TOPIC else None
 
-# Tried in order — first one that returns a real-looking page wins.
+# codetabs first — it's the one that actually returns real HTML for us.
 PROXIES = [
-    "https://corsproxy.io/?url=",
     "https://api.codetabs.com/v1/proxy?quest=",
     "https://api.allorigins.win/raw?url=",
-    "https://cors.lol/?url=",
 ]
 
 HEADERS = {
@@ -41,117 +41,59 @@ def log(msg: str) -> None:
 
 
 def fetch_html() -> str | None:
-    """Try each proxy until one returns HTML that contains __NEXT_DATA__."""
+    """Try proxies; validate by presence of the product ID in the response."""
     encoded = quote(PRODUCT_URL, safe="")
     for proxy in PROXIES:
         url = proxy + encoded
-        proxy_name = proxy.split("//")[1].split("/")[0]
+        name = proxy.split("//")[1].split("/")[0]
         try:
             r = requests.get(url, headers=HEADERS, timeout=30)
             r.raise_for_status()
             html = r.text
-            if "__NEXT_DATA__" in html:
-                log(f"Got {len(html)} bytes via {proxy_name} ✓")
+            if PRODUCT_ID in html:
+                log(f"{name}: {len(html)} bytes, product ID found ✓")
                 return html
-            log(f"{proxy_name}: returned {len(html)} bytes but no __NEXT_DATA__ — trying next")
+            log(f"{name}: {len(html)} bytes but product ID missing — trying next")
         except Exception as e:
-            log(f"{proxy_name}: {e} — trying next")
+            log(f"{name}: {e} — trying next")
     return None
 
 
-def extract_next_data(html: str):
-    m = re.search(
-        r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
-        html, re.DOTALL,
-    )
-    if not m:
-        return None
-    try:
-        return json.loads(m.group(1))
-    except json.JSONDecodeError:
-        return None
+def dump_size_context(html: str, target: str) -> None:
+    """Print all snippets of HTML around occurrences of the target size."""
+    log(f"--- Searching for '{target}' in HTML ---")
+    count = 0
+    for m in re.finditer(re.escape(target), html):
+        count += 1
+        if count > 6:
+            log(f"  (… {len([1 for _ in re.finditer(re.escape(target), html)]) - 6} more occurrences omitted)")
+            break
+        start = max(0, m.start() - 120)
+        end = min(len(html), m.end() + 250)
+        snippet = html[start:end].replace("\n", " ").replace("  ", " ")
+        log(f"  [match {count}] …{snippet}…")
+    if count == 0:
+        log(f"  '{target}' not found in HTML at all.")
+    log(f"--- End search ({count} matches found) ---")
 
 
-def find_variants(obj):
-    SIZE_KEYS  = {"size", "sizeName", "sizeLabel", "name", "label", "title"}
-    STOCK_KEYS = {"inStock", "available", "isInStock", "stock",
-                  "availability", "stockStatus", "quantity"}
-    found = []
-
-    def walk(node):
-        if isinstance(node, dict):
-            keys = set(node.keys())
-            if keys & SIZE_KEYS and keys & STOCK_KEYS:
-                found.append(node)
-            for v in node.values():
-                walk(v)
-        elif isinstance(node, list):
-            for v in node:
-                walk(v)
-
-    walk(obj)
-    return found
-
-
-def normalize(s: str) -> str:
-    """Normalize size labels: '3XL', 'XXXL', '3X-LARGE' all become 'XXX'."""
-    s = re.sub(r"[\s\-_]", "", str(s)).upper()
-    s = s.replace("LARGE", "L").replace("MEDIUM", "M").replace("SMALL", "S")
-    # Expand 3XL / 4XL etc. to XXXL / XXXXL
-    m = re.match(r"^(\d+)X+L?$", s)
-    if m:
-        s = "X" * int(m.group(1)) + "L"
-    return s
-
-
-def variant_size_label(v: dict) -> str:
-    for k in ("size", "sizeName", "sizeLabel", "name", "label", "title"):
-        if k in v and v[k]:
-            return str(v[k])
-    return ""
-
-
-def variant_in_stock(v: dict):
-    if "inStock"   in v: return bool(v["inStock"])
-    if "isInStock" in v: return bool(v["isInStock"])
-    if "available" in v: return bool(v["available"])
-    if "stockStatus" in v:
-        return str(v["stockStatus"]).lower() in {"instock", "in_stock", "available", "yes"}
-    if "availability" in v:
-        return str(v["availability"]).lower() in {"instock", "in_stock", "available", "yes"}
-    if "stock" in v:
-        try: return int(v["stock"]) > 0
-        except: pass
-    if "quantity" in v:
-        try: return int(v["quantity"]) > 0
-        except: pass
-    return None
-
-
-def check_size_available(html: str, target: str):
-    data = extract_next_data(html)
-    target_norm = normalize(target)
-    if data:
-        variants = find_variants(data)
-        all_labels = sorted({variant_size_label(v) for v in variants if variant_size_label(v)})
-        matches = [v for v in variants if normalize(variant_size_label(v)) == target_norm]
-        if matches:
-            for v in matches:
-                if variant_in_stock(v) is True:
-                    return True, f"JSON variant in stock: {variant_size_label(v)}"
-            return False, f"{len(matches)} variant(s) for {target} but none in stock"
-        debug = f"No variant for {target}. All size labels found: {all_labels[:20]}"
-    else:
-        debug = "No __NEXT_DATA__ block found"
-
-    fallback = re.search(
-        rf'"size"\s*:\s*"{re.escape(target)}"[^{{}}]{{0,200}}'
-        rf'("inStock"\s*:\s*true|"available"\s*:\s*true|"stock"\s*:\s*[1-9])',
-        html, re.IGNORECASE,
-    )
-    if fallback:
-        return True, "HTML fallback matched in-stock pattern"
-    return False, debug
+def look_for_data_patterns(html: str) -> None:
+    """Scan for likely places that contain size/stock data."""
+    log("--- Scanning for data containers ---")
+    patterns = [
+        (r'<script id="__NEXT_DATA__"', "__NEXT_DATA__ script tag"),
+        (r'self\.__next_f\.push', "Next.js App Router payload (__next_f)"),
+        (r'window\.__INITIAL_STATE__', "Generic window.__INITIAL_STATE__"),
+        (r'"variants"\s*:', "JSON 'variants' key"),
+        (r'"sizes"\s*:', "JSON 'sizes' key"),
+        (r'"inStock"', "JSON 'inStock' key"),
+        (r'"available"', "JSON 'available' key"),
+        (r'data-size=', "HTML data-size attribute"),
+    ]
+    for pat, label in patterns:
+        hits = len(re.findall(pat, html))
+        log(f"  {label}: {hits} occurrences")
+    log("--- End scan ---")
 
 
 def send_ntfy(title: str, message: str) -> None:
@@ -163,10 +105,8 @@ def send_ntfy(title: str, message: str) -> None:
             NTFY_URL,
             data=message.encode("utf-8"),
             headers={
-                "Title": title,
-                "Priority": "5",
-                "Tags": "shopping_cart,norway",
-                "Click": PRODUCT_URL,
+                "Title": title, "Priority": "5",
+                "Tags": "shopping_cart,norway", "Click": PRODUCT_URL,
                 "Actions": f"view, Buy now, {PRODUCT_URL}",
             },
             timeout=15,
@@ -183,15 +123,22 @@ def main() -> int:
         log("All proxies failed.")
         return 0
 
-    available, info = check_size_available(html, TARGET_SIZE)
-    if available:
-        log(f"✅ {TARGET_SIZE} IS AVAILABLE — {info}")
+    look_for_data_patterns(html)
+    dump_size_context(html, TARGET_SIZE)
+
+    # Also try common quick stock checks for now — we'll refine after seeing context.
+    quick_in_stock = re.search(
+        rf'"3XL"[^{{}}]{{0,200}}("inStock"\s*:\s*true|"available"\s*:\s*true|"stock"\s*:\s*[1-9])',
+        html, re.IGNORECASE,
+    )
+    if quick_in_stock:
+        log(f"✅ Quick check says {TARGET_SIZE} is available")
         send_ntfy(
             f"Norge jersey: {TARGET_SIZE} in stock!",
             f"Tap to buy now.\n{PRODUCT_URL}",
         )
     else:
-        log(f"❌ {TARGET_SIZE} not available — {info}")
+        log(f"❌ Quick check: {TARGET_SIZE} not detected as available")
     return 0
 
 
