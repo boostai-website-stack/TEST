@@ -1,7 +1,7 @@
 """
 Stock check for the Norge Hjemmedrakt — single run, exits when done.
-Parses Unisport's Next.js App Router payload for the target size's
-'availability' field. Sends ntfy push when 'in stock'.
+Monitors one or more sizes. Sends a single ntfy push per run listing
+whichever target sizes are currently in stock.
 """
 
 import os
@@ -12,9 +12,9 @@ from urllib.parse import quote
 
 import requests
 
-PRODUCT_URL = "https://www.unisportstore.no/fotballdrakter/norge-hjemmedrakt-world-cup-2026/461740/"
-TARGET_SIZE = "XL"
-PRODUCT_ID  = "461740"
+PRODUCT_URL  = "https://www.unisportstore.no/fotballdrakter/norge-hjemmedrakt-world-cup-2026/461740/"
+TARGET_SIZES = ["XL", "L"]   # add or remove sizes here
+PRODUCT_ID   = "461740"
 
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 NTFY_URL   = f"https://ntfy.sh/{NTFY_TOPIC}" if NTFY_TOPIC else None
@@ -58,12 +58,6 @@ def fetch_html() -> str | None:
 
 
 def check_size_available(html: str, target: str) -> tuple[bool, str]:
-    """
-    Variants live as escaped JSON inside __next_f.push chunks:
-        \"name\":\"3XL\", ... ,\"availability\":\"in stock\"
-    We look for the size's name followed (within ~1000 chars) by an
-    availability value, then judge whether that value means 'in stock'.
-    """
     target_esc = re.escape(target)
     pattern = (
         r'\\"name\\":\\"' + target_esc + r'\\"'
@@ -76,8 +70,6 @@ def check_size_available(html: str, target: str) -> tuple[bool, str]:
         if availability in IN_STOCK_VALUES:
             return True, f"availability = '{m.group(1)}'"
         return False, f"availability = '{m.group(1)}'"
-
-    # Size didn't match alongside an availability field — see if it exists at all
     if re.search(r'\\"name\\":\\"' + target_esc + r'\\"', html):
         return False, f"variant '{target}' present but no availability field nearby"
     return False, f"variant '{target}' not found in page data"
@@ -104,21 +96,27 @@ def send_ntfy(title: str, message: str) -> None:
 
 
 def main() -> int:
-    log(f"Checking {TARGET_SIZE} on Unisport…")
+    log(f"Checking sizes {TARGET_SIZES} on Unisport…")
     html = fetch_html()
     if html is None:
         log("All proxies failed — will try again next run.")
         return 0
 
-    available, info = check_size_available(html, TARGET_SIZE)
-    if available:
-        log(f"✅ {TARGET_SIZE} IS AVAILABLE — {info}")
+    available_sizes: list[str] = []
+    for size in TARGET_SIZES:
+        ok, info = check_size_available(html, size)
+        if ok:
+            log(f"✅ {size} IS AVAILABLE — {info}")
+            available_sizes.append(size)
+        else:
+            log(f"❌ {size} not available — {info}")
+
+    if available_sizes:
+        sizes_str = ", ".join(available_sizes)
         send_ntfy(
-            f"Norge jersey: {TARGET_SIZE} in stock!",
+            f"Norge jersey: {sizes_str} in stock!",
             f"Tap to buy now.\n{PRODUCT_URL}",
         )
-    else:
-        log(f"❌ {TARGET_SIZE} not available — {info}")
     return 0
 
 
