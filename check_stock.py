@@ -1,7 +1,7 @@
 """
-Stock check for the Norge Hjemmedrakt — single run, exits when done.
-Monitors one or more sizes. Sends a single ntfy push per run listing
-whichever target sizes are currently in stock.
+Stock check for Norge jerseys — single run, exits when done.
+Monitors multiple products, each with its own target sizes.
+Sends one ntfy push per product when any of its target sizes are in stock.
 """
 
 import os
@@ -12,9 +12,20 @@ from urllib.parse import quote
 
 import requests
 
-PRODUCT_URL  = "https://www.unisportstore.no/fotballdrakter/norge-hjemmedrakt-world-cup-2026/461740/"
-TARGET_SIZES = ["XL", "L"]   # add or remove sizes here
-PRODUCT_ID   = "461740"
+PRODUCTS = [
+    {
+        "name":  "Hjemmedrakt",
+        "url":   "https://www.unisportstore.no/fotballdrakter/norge-hjemmedrakt-world-cup-2026/461740/",
+        "id":    "461740",
+        "sizes": ["XL", "L"],
+    },
+    {
+        "name":  "Bortedrakt",
+        "url":   "https://www.unisportstore.no/fotballdrakter/norge-bortedrakt-world-cup-2026/461742/",
+        "id":    "461742",
+        "sizes": ["XL", "L"],
+    },
+]
 
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 NTFY_URL   = f"https://ntfy.sh/{NTFY_TOPIC}" if NTFY_TOPIC else None
@@ -40,20 +51,20 @@ def log(msg: str) -> None:
     print(f"[{datetime.utcnow().isoformat(timespec='seconds')}Z] {msg}", flush=True)
 
 
-def fetch_html() -> str | None:
-    encoded = quote(PRODUCT_URL, safe="")
+def fetch_html(url: str, product_id: str) -> str | None:
+    encoded = quote(url, safe="")
     for proxy in PROXIES:
         name = proxy.split("//")[1].split("/")[0]
         try:
             r = requests.get(proxy + encoded, headers=HEADERS, timeout=30)
             r.raise_for_status()
             html = r.text
-            if PRODUCT_ID in html:
-                log(f"{name}: {len(html)} bytes ✓")
+            if product_id in html:
+                log(f"  {name}: {len(html)} bytes ✓")
                 return html
-            log(f"{name}: {len(html)} bytes, product ID missing — trying next")
+            log(f"  {name}: {len(html)} bytes, product ID missing — trying next")
         except Exception as e:
-            log(f"{name}: {e} — trying next")
+            log(f"  {name}: {e} — trying next")
     return None
 
 
@@ -75,7 +86,7 @@ def check_size_available(html: str, target: str) -> tuple[bool, str]:
     return False, f"variant '{target}' not found in page data"
 
 
-def send_ntfy(title: str, message: str) -> None:
+def send_ntfy(title: str, message: str, click_url: str) -> None:
     if not NTFY_URL:
         log("NTFY_TOPIC not set — skipping push notification.")
         return
@@ -85,38 +96,49 @@ def send_ntfy(title: str, message: str) -> None:
             data=message.encode("utf-8"),
             headers={
                 "Title": title, "Priority": "5",
-                "Tags": "shopping_cart,norway", "Click": PRODUCT_URL,
-                "Actions": f"view, Buy now, {PRODUCT_URL}",
+                "Tags": "shopping_cart,norway",
+                "Click": click_url,
+                "Actions": f"view, Buy now, {click_url}",
             },
             timeout=15,
         )
-        log("ntfy push sent.")
+        log("  ntfy push sent.")
     except Exception as e:
-        log(f"ntfy push failed: {e}")
+        log(f"  ntfy push failed: {e}")
+
+
+def check_product(product: dict) -> None:
+    name  = product["name"]
+    url   = product["url"]
+    sizes = product["sizes"]
+    log(f"== {name} (sizes: {sizes}) ==")
+
+    html = fetch_html(url, product["id"])
+    if html is None:
+        log(f"  All proxies failed for {name}.")
+        return
+
+    available = []
+    for size in sizes:
+        ok, info = check_size_available(html, size)
+        if ok:
+            log(f"  ✅ {size} — {info}")
+            available.append(size)
+        else:
+            log(f"  ❌ {size} — {info}")
+
+    if available:
+        sizes_str = ", ".join(available)
+        send_ntfy(
+            title     = f"{name}: {sizes_str} in stock!",
+            message   = f"Tap to buy now.\n{url}",
+            click_url = url,
+        )
 
 
 def main() -> int:
-    log(f"Checking sizes {TARGET_SIZES} on Unisport…")
-    html = fetch_html()
-    if html is None:
-        log("All proxies failed — will try again next run.")
-        return 0
-
-    available_sizes: list[str] = []
-    for size in TARGET_SIZES:
-        ok, info = check_size_available(html, size)
-        if ok:
-            log(f"✅ {size} IS AVAILABLE — {info}")
-            available_sizes.append(size)
-        else:
-            log(f"❌ {size} not available — {info}")
-
-    if available_sizes:
-        sizes_str = ", ".join(available_sizes)
-        send_ntfy(
-            f"Norge jersey: {sizes_str} in stock!",
-            f"Tap to buy now.\n{PRODUCT_URL}",
-        )
+    for product in PRODUCTS:
+        check_product(product)
     return 0
 
 
