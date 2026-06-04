@@ -17,13 +17,13 @@ PRODUCTS = [
         "name":  "Hjemmedrakt",
         "url":   "https://www.unisportstore.no/fotballdrakter/norge-hjemmedrakt-world-cup-2026/461740/",
         "id":    "461740",
-        "sizes": ["XL", "L"],
+        "sizes": ["XL", "XXXXXL"],
     },
     {
         "name":  "Bortedrakt",
         "url":   "https://www.unisportstore.no/fotballdrakter/norge-bortedrakt-world-cup-2026/461742/",
         "id":    "461742",
-        "sizes": ["XL", "L"],
+        "sizes": ["XL", "XXXXXL"],
     },
 ]
 
